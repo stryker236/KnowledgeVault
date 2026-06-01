@@ -32,3 +32,7 @@ Write tests for new functionality.
 
 - Don't need to verify if milestone and issue was really created, just create it and move on
 - Don't need to give long formatted feedback on the created milestone and issue, just create it and move on
+
+## Personal rules
+
+- Don't need to check diffs after development
