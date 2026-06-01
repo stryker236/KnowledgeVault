@@ -1,9 +1,8 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-const initialStatus = "No folder open";
+const initialStatus = "Backend not checked";
 
 export default function App() {
-  const [directoryHandle, setDirectoryHandle] = useState(null);
   const [files, setFiles] = useState([]);
   const [activeFile, setActiveFile] = useState(null);
   const [content, setContent] = useState("");
@@ -12,6 +11,8 @@ export default function App() {
   const [newFileName, setNewFileName] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [status, setStatus] = useState(initialStatus);
+  const [isBackendReady, setIsBackendReady] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
 
   const filteredFiles = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
@@ -20,36 +21,28 @@ export default function App() {
 
   const previewMarkup = useMemo(() => ({ __html: markdownToHtml(content) }), [content]);
   const normalizedNewFileName = normalizeMarkdownName(newFileName);
-  const canUseVault = Boolean(directoryHandle);
+  const canUseVault = isBackendReady;
   const canCreate = canUseVault && normalizedNewFileName !== "";
   const canSave = Boolean(activeFile) && isDirty;
 
-  async function openVault() {
-    if (!supportsFileSystemAccess()) {
-      setStatus("Use Chrome or Edge on localhost");
-      return;
-    }
+  useEffect(() => {
+    refreshFiles();
+  }, []);
 
+  async function refreshFiles() {
+    setIsLoading(true);
     try {
-      const handle = await window.showDirectoryPicker({ mode: "readwrite" });
-      setDirectoryHandle(handle);
-      setStatus(handle.name);
-      await refreshFiles(handle);
+      const response = await apiRequest("/api/notes");
+      const nextFiles = response.files.toSorted((first, second) => first.path.localeCompare(second.path));
+      setFiles(nextFiles);
+      setIsBackendReady(true);
+      setStatus("Connected to storage");
     } catch (error) {
-      if (error.name !== "AbortError") {
-        setStatus("Could not open folder");
-      }
+      setIsBackendReady(false);
+      setStatus(error.message);
+    } finally {
+      setIsLoading(false);
     }
-  }
-
-  async function refreshFiles(handle = directoryHandle) {
-    if (!handle) {
-      return;
-    }
-
-    const nextFiles = await collectMarkdownFiles(handle);
-    nextFiles.sort((first, second) => first.path.localeCompare(second.path));
-    setFiles(nextFiles);
   }
 
   async function openFile(fileEntry) {
@@ -57,36 +50,36 @@ export default function App() {
       return;
     }
 
-    const file = await fileEntry.handle.getFile();
-    setContent(await file.text());
-    setActiveFile(fileEntry);
-    setIsDirty(false);
-    setMode("edit");
+    try {
+      const note = await apiRequest(`/api/notes/${encodeNotePath(fileEntry.path)}`);
+      setContent(note.content);
+      setActiveFile({ path: note.path });
+      setIsDirty(false);
+      setMode("edit");
+      setStatus("Connected to storage");
+    } catch (error) {
+      setStatus(error.message);
+    }
   }
 
   async function createFile() {
-    if (!directoryHandle || !normalizedNewFileName) {
+    if (!isBackendReady || !normalizedNewFileName) {
       return;
     }
 
-    const handle = await getOrCreateFileHandle(directoryHandle, normalizedNewFileName);
-    const writable = await handle.createWritable();
-    await writable.write(`# ${titleFromFileName(normalizedNewFileName)}\n\n`);
-    await writable.close();
-
-    setNewFileName("");
-
-    const nextFiles = await collectMarkdownFiles(directoryHandle);
-    nextFiles.sort((first, second) => first.path.localeCompare(second.path));
-    setFiles(nextFiles);
-
-    const created = nextFiles.find((file) => file.path === normalizedNewFileName);
-    if (created) {
-      const file = await created.handle.getFile();
-      setContent(await file.text());
-      setActiveFile(created);
+    try {
+      const note = await apiRequest("/api/notes", {
+        method: "POST",
+        body: JSON.stringify({ path: normalizedNewFileName }),
+      });
+      setNewFileName("");
+      setContent(note.content);
+      setActiveFile({ path: note.path });
       setIsDirty(false);
       setMode("edit");
+      await refreshFiles();
+    } catch (error) {
+      setStatus(error.message);
     }
   }
 
@@ -95,10 +88,16 @@ export default function App() {
       return;
     }
 
-    const writable = await activeFile.handle.createWritable();
-    await writable.write(content);
-    await writable.close();
-    setIsDirty(false);
+    try {
+      await apiRequest(`/api/notes/${encodeNotePath(activeFile.path)}`, {
+        method: "PUT",
+        body: JSON.stringify({ content }),
+      });
+      setIsDirty(false);
+      setStatus("Saved to storage");
+    } catch (error) {
+      setStatus(error.message);
+    }
   }
 
   function updateContent(nextContent) {
@@ -118,10 +117,10 @@ export default function App() {
 
         <section className="panel">
           <div className="button-row">
-            <button type="button" onClick={openVault}>
-              Open storage
+            <button type="button" onClick={refreshFiles}>
+              Load storage
             </button>
-            <button type="button" onClick={() => refreshFiles()} disabled={!canUseVault}>
+            <button type="button" onClick={refreshFiles} disabled={!canUseVault || isLoading}>
               Refresh
             </button>
           </div>
@@ -249,40 +248,6 @@ function FileList({ activePath, canUseVault, files, onOpenFile }) {
   );
 }
 
-function supportsFileSystemAccess() {
-  return "showDirectoryPicker" in window;
-}
-
-async function collectMarkdownFiles(directoryHandle, prefix = "") {
-  const files = [];
-
-  for await (const [name, handle] of directoryHandle.entries()) {
-    const path = prefix ? `${prefix}/${name}` : name;
-
-    if (handle.kind === "directory") {
-      files.push(...await collectMarkdownFiles(handle, path));
-    }
-
-    if (handle.kind === "file" && name.toLowerCase().endsWith(".md")) {
-      files.push({ name, path, handle });
-    }
-  }
-
-  return files;
-}
-
-async function getOrCreateFileHandle(directoryHandle, path) {
-  const parts = path.split("/");
-  const name = parts.pop();
-  let directory = directoryHandle;
-
-  for (const part of parts) {
-    directory = await directory.getDirectoryHandle(part, { create: true });
-  }
-
-  return directory.getFileHandle(name, { create: true });
-}
-
 function normalizeMarkdownName(value) {
   const trimmed = value.trim().replaceAll("\\", "/").replace(/^\/+/, "");
   const hasUnsafeSegment = trimmed.split("/").some((part) => part === "" || part === "." || part === "..");
@@ -292,13 +257,6 @@ function normalizeMarkdownName(value) {
   }
 
   return trimmed.toLowerCase().endsWith(".md") ? trimmed : `${trimmed}.md`;
-}
-
-function titleFromFileName(fileName) {
-  const baseName = fileName.split("/").pop().replace(/\.md$/i, "");
-  return baseName
-    .replace(/[-_]+/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function markdownToHtml(markdown) {
@@ -376,4 +334,25 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+async function apiRequest(path, options = {}) {
+  const response = await fetch(path, {
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+    ...options,
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Request failed" }));
+    throw new Error(error.detail ?? "Request failed");
+  }
+
+  return response.json();
+}
+
+function encodeNotePath(path) {
+  return path.split("/").map(encodeURIComponent).join("/");
 }
